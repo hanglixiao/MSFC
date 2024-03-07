@@ -1,0 +1,84 @@
+import torch
+import torch.nn as nn
+
+class SELayer(nn.Module):
+    def __init__(self, channels, reduction=8):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+class DSConv2d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        super(DSConv2d, self).__init__()
+        # 深度卷积层
+        self.depthwise_conv = nn.Conv2d(in_channels, in_channels, kernel_size=kernel_size, stride=stride, padding=padding, groups=in_channels)
+        # 逐点卷积层
+        self.pointwise_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        # Batch Normalization
+        self.bn = nn.BatchNorm2d(out_channels)
+        # ReLU 激活函数
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        # 深度卷积
+        x = self.depthwise_conv(x)
+        # 逐点卷积
+        x = self.pointwise_conv(x)
+        # Batch Normalization
+        x = self.bn(x)
+        # ReLU 激活函数
+        x = self.relu(x)
+        return x
+
+class MSFC(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(MSFC, self).__init__()
+        # 减少通道数
+        self.channel_reduction = nn.Conv2d(in_channels, in_channels // 4, kernel_size=1)
+        
+        # 为每个尺度创建DSConv2d层
+        self.dsconv_3 = DSConv2d(in_channels // 4, in_channels // 4, kernel_size=3, padding=1)
+        self.dsconv_5 = DSConv2d(in_channels // 4, in_channels // 4, kernel_size=5, padding=2)
+        self.dsconv_7 = DSConv2d(in_channels // 4, in_channels // 4, kernel_size=7, padding=3)
+        self.dsconv_9 = DSConv2d(in_channels // 4, in_channels // 4, kernel_size=9, padding=4)
+        self.dsconv_11 = DSConv2d(in_channels // 4, in_channels // 4, kernel_size=11, padding=5)
+
+        # 添加SE模块
+        self.se1 = SELayer(in_channels // 4 )
+        self.se2 = SELayer(in_channels // 4 * 5)
+
+        # 恢复通道
+        self.channel_recover = nn.Conv2d(in_channels // 4 * 5, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        # 减少通道数
+        x = self.channel_reduction(x)
+        
+        # 分别在每个尺度上应用DSConv2d
+        scale_output_3 = self.se1(self.dsconv_3(x))
+        scale_output_5 = self.se1(self.dsconv_5(x))
+        scale_output_7 = self.se1(self.dsconv_7(x))
+        scale_output_9 = self.se1(self.dsconv_9(x))
+        scale_output_11 = self.se1(self.dsconv_11(x))
+        
+        # 合并尺度特征
+        output = torch.cat((scale_output_3, scale_output_5, scale_output_7, scale_output_9, scale_output_11), dim=1)
+        
+        # 应用SE模块
+        output = self.se2(output)
+        
+        # 恢复通道数
+        output = self.channel_recover(output)
+        
+        return output
